@@ -1,0 +1,2016 @@
+/*
+ *  This program is free software; you can redistribute it and/or
+ *  modify it under the terms of the Apache License, Version 2.0.
+ *
+ *  Copyright:
+ *     2020, Vincent Barichard <Vincent.Barichard@univ-angers.fr>
+ *
+ *     Licensed under the Apache License, Version 2.0 (the "License");
+ *     you may not use this file except in compliance with the License.
+ *     You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *     Unless required by applicable law or agreed to in writing, software
+ *     distributed under the License is distributed on an "AS IS" BASIS,
+ *     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *     See the License for the specific language governing permissions and
+ *     limitations under the License.
+ *
+ */
+
+#include <iostream>
+#include <vector>
+#include <memory>
+#include <chrpp.hh>
+
+#include <options.hpp>
+
+#include <bt_interval.hh>
+
+#include "cp_int.h"
+
+#include "debug.h"
+
+using intvar = chr::Interval<int, false>;
+using interval = chr::Interval<int, true>;
+
+/**
+ * @brief Timetabling program
+ *
+ * CHR program for timetabling
+ */
+class TIMETABLING
+{
+
+    chr::ES_CHR debug(std::string msg) {
+        //std::cout << "DEBUG (depth=" << chr::Backtrack::depth() << ") : " << msg << std::endl;
+        return chr::success();
+    }
+
+    bool debug_garde(std::string msg) const {
+        std::cout << "DEBUG: " << msg << std::endl;
+        return true;
+    }
+
+    std::vector<int> failures = {0};
+
+    chr::ES_CHR nextState(int currentState) {
+        std::cout << "State " << currentState << std::endl;
+        chr::Statistics::print(std::cout);
+
+        failures.push_back(0);
+
+        return chr::success();
+    }
+
+    chr::ES_CHR debugFailure(int state, std::string msg) {
+        failures[state]++;
+        //std::cout << "DEBUG FAILURE (depth=" << chr::Backtrack::depth() << ";state=" << state << "): " << msg << std::endl;
+        return chr::failure();
+    }
+
+    // We forbid every session slots that would make the session to overlap between two days
+    chr::ES_CHR check_session_end(chr::Logical_var_mutable< intvar > &session_slot, int session_length, int nr_slots_per_day, int nr_slots) {
+        assert(session_length >= 1);
+        bool modified;
+
+        if(session_length == 1) { // no need to check session end for those sessions
+            return chr::success();
+        }
+
+        return session_slot.update_mutable(modified, [&modified,session_length,nr_slots_per_day,nr_slots](auto &intvl) {
+            modified = false;
+
+            for(int slot=nr_slots_per_day; slot<nr_slots; slot+=nr_slots_per_day) {
+                // slot = first slot of a day
+                for(int i=1; i<session_length; ++i) {
+                    // we remove all the slots that would mean an overlap
+                    modified |= intvl.nq(slot-i);
+                }
+            }
+
+            // We also remove all the last slots of the time window
+            for(int l=1; l<session_length; ++l) {
+                modified |= intvl.nq(nr_slots-l);
+            }
+        });
+    }
+
+    chr::ES_CHR setSessionSlot(int session, int slot, chr::Logical_var_mutable< intvar > &domain) {
+        bool modified;
+        m_sessionSlot[session] = slot;
+
+        return domain.update_mutable(modified, [&modified,slot](auto& intvl) {
+            modified = intvl.eq(slot);
+        });
+    }
+
+    chr::ES_CHR setSessionGroupRoom(int session, int groupIndex, int room, chr::Logical_var_mutable< intvar > &domain) {
+        //std::cout << "DEBUG: setSessionGroupRoom(" << session << ", " << groupIndex << ", " << room << ")" << std::endl;
+        bool modified;
+        m_sessionGroupRoom[session][groupIndex] = room;
+
+        return domain.update_mutable(modified, [&modified,room](auto& intvl) {
+            modified = intvl.eq(room);
+        });
+    }
+
+    chr::ES_CHR setTeacher(int teacher, chr::Logical_var_mutable< intvar > &domain) {
+        bool modified;
+        return domain.update_mutable(modified, [&modified,teacher](auto& intvl) {
+            modified = intvl.eq(teacher);
+        });
+    }
+
+    chr::ES_CHR generate_group_same_attendees() {
+        // We generate as many sameAttendees constraint as groups
+        for(auto& it : m_groupSessions) {
+            CHECK_ES( sameAttendees(it.second) );
+        }
+
+        return chr::success();
+    }
+
+    int nbOverlapSlots(const intvar &start, const intvar &end, int length, int rangeMin, int rangeMax) const {
+        if(start.singleton()) {
+            // we must compute how many slots from s to e are in the range
+            int nb_overlap_slots = 0;
+
+            if(rangeMin <= start.val() && end.val() <= rangeMax) {
+                // the session is totally included in the range
+                nb_overlap_slots = length;
+            } else if(start.val() <= rangeMin && rangeMax <= end.val()) {
+                // the range is totally included in the session
+                nb_overlap_slots = rangeMax - rangeMin + 1;
+            } else if(start.val() <= rangeMin) {
+                // the session starts before and ends in the range
+                nb_overlap_slots = end.val() - rangeMin + 1;
+            } else if(rangeMax <= end.val()) {
+                // the session start in and ends after the range
+                nb_overlap_slots = rangeMax - start.val() + 1;
+            } else {
+                // should not occur
+                assert(false);
+            }
+
+            // we remove the slots from the threshold
+            return nb_overlap_slots;
+        }
+
+        // both are not singletons
+
+        if(!start.singleton() && !end.singleton() && rangeMin <= start.min() && end.max() <= rangeMax) {
+            // the session is not yet fixed in time
+            // but we know that it will be within the range
+
+            return length;
+        } else {
+            // should not be called
+            assert(false);
+        }
+
+        return 0;
+    }
+
+    chr::ES_CHR postDisjunctWeekly(int weeklyId1, int weeklyId2) {
+        int firstSessionId1 = m_weeklySessions[weeklyId1][0];
+        int firstSessionId2 = m_weeklySessions[weeklyId2][0];
+        size_t i_sessionId1=1;
+        size_t i_sessionId2=1;
+
+        // We post the disjunct to first force the "comb": A1 < B1 < A2 < B2.
+        // First A1 > B1
+        CHECK_ES( post_disjunct(firstSessionId1, firstSessionId2) );
+
+        // We then post all the disjunct that alternates A1 < Bi ; B1 < Ai
+        while(i_sessionId1 < m_weeklySessions[weeklyId1].size() && i_sessionId2 < m_weeklySessions[weeklyId2].size()) {
+            CHECK_ES( post_disjunct(firstSessionId1, m_weeklySessions[weeklyId2][i_sessionId2]) );
+            CHECK_ES( post_disjunct(firstSessionId2, m_weeklySessions[weeklyId1][i_sessionId1]) );
+
+            ++i_sessionId1;
+            ++i_sessionId2;
+        }
+        // Now we post all the remaining ones (either weely1 or weekly2):
+        while(i_sessionId1 < m_weeklySessions[weeklyId1].size()) {
+            CHECK_ES( post_disjunct(firstSessionId2, m_weeklySessions[weeklyId1][i_sessionId1]) );
+
+            ++i_sessionId1;
+        }
+        while(i_sessionId2 < m_weeklySessions[weeklyId2].size()) {
+            CHECK_ES( post_disjunct(firstSessionId1, m_weeklySessions[weeklyId2][i_sessionId2]) );
+
+            ++i_sessionId2;
+        }
+
+        return chr::success();
+    }
+
+    chr::ES_CHR end() {
+
+        m_ended = true;
+        print();
+
+        for(auto& s_t : get_session_teacher_store()) {
+            //std::cout << "DEBUG: " << *s_t._p0 << "=" << (*s_t._p1).to_string() << std::endl;
+            m_sessionTeachers[*s_t._p0].push_back((*s_t._p2).val());
+        }
+
+        return chr::success();
+    }
+
+    chr::ES_CHR displayStoreSize() {
+        auto it = chr_store_begin();
+        int size=0;
+        while(!it.at_end()) {
+            ++it;
+            ++size;
+        }
+        std::cout << "storeSize=" << size << std::endl;
+
+        return chr::success();
+    }
+	
+    /*<CHR>
+
+        //////////////////////////////////////////////
+        //                                          //
+        // CONSTRAINT DECLARATIONS                  //
+        //                                          //
+        //////////////////////////////////////////////
+
+        // -------------------------------------------------------------------------------
+        // PROBLEM CONSTANTS
+        // Total number of sessions
+        <chr_constraint> nr_sessions(+int)
+
+        // -------------------------------------------------------------------------------
+        // PROBLEM OUTPUTS
+        // - SESSIONS
+        // One "session" is defined by the class, and the index of the session in the class
+        // ClassId links the session to the course
+        // Index differenciate the different sessions of the class
+        // session(SessionId, ClassId, Index)
+        <chr_constraint> session(+int, +int, +int) #cpp_private
+
+        // Several groups form a class.
+        // We must know the GroupIds attached to a class, and the index of the group
+        // class_group(ClassId, GroupId, GroupIndex)
+        <chr_constraint> class_group(+int, +int, +int) #cpp_private
+        // We must also know how many groups are in one class
+        // class_size(ClassId, NbGroups)
+        <chr_constraint> class_size(+int, +int) #cpp_private
+
+        // A session can only have one slot.
+        // Start + (Length-1) = End
+        // All sessions from the same class should be at the same time (not verified in the model)
+        // session_slot(SessionId, Start, End, Length)
+        <chr_constraint> session_slot(+int, -intvar, -intvar, +int) #cpp_private
+        // Set a value for the start of a session
+        // set_session_slot(ClassId, SessionIndex, StartingSlot)
+        <chr_constraint> set_session_slot(+int, +int, +int) #cpp_private
+
+        // A session can be in several rooms,
+        // A room can host several sessions OF THE SAME CLASS at the same time
+        // A session in several rooms means that one group of each class of the session can be in different rooms
+        // We must know in which room the group are assigned.
+        // session_group_room(SessionId, GroupId, Room)
+        <chr_constraint> session_group_room(+int, +int, -intvar) #cpp_private
+
+        // A session can have several teachers,
+        // A teacher can have several sessions OF THE SAME CLASS at the same time
+        // session_teacher(SessionId, TeacherIndex, Teacher)
+        <chr_constraint> session_teacher(+int, +int, -intvar) #cpp_private
+        // set_session_teacher(ClassId, SessionIndex, TeacherIndex, TeacherId)
+        <chr_constraint> set_session_teacher(+int, +int, +int, +int) #cpp_private
+
+        // A session can have several equipments,
+        // An equipment can be linked to several session OF THE SAME CLASS at the same time
+        // session_equipment(SessionId, Equipment)
+        <chr_constraint> session_equipment(+int, -intvar) #cpp_private
+
+        // - ROOMS
+        // A room has a maximum capacity
+        // room_capacity(RoomId, Capacity)
+        <chr_constraint> room_capacity(+int, +int)
+
+        // A room can be used by several groups of the same class
+        // Each group from the session will post
+        // a room_space_occupied constraint when the room is fixed.
+        // a room_space_occupied should never overflow the room capacity
+        // room_space_occupied(RoomId, SessionId, Occupied)
+        <chr_constraint> room_space_occupied(+int, +int, +int) #cpp_private
+
+        // - GROUPS
+        // A group has a size
+        // group_size(GroupId, Size)
+        <chr_constraint> group_size(+int, +int)
+
+        // - TEACHERS
+        // A session can have several teachers.
+        // session_nr_teachers(SessionId, NrTeachers)
+        <chr_constraint> session_nr_teachers(+int, +int)
+
+        // -------------------------------------------------------------------------------
+        // POST OUTPUTS
+        <chr_constraint> post_session_slot(+int, -intvar, -intvar, +int)
+
+        // -------------------------------------------------------------------------------
+        // PROBLEM CONSTRAINTS
+
+        // - PRECEDENCE(SessionID1, SessionID2)
+        // SessionID1 should takes place before SessionID2
+        <chr_constraint> precedence(+int, +int)
+
+        // - DISJUNCT(DisjunctId, SessionId1, SessionId2)
+        // Session1 and Session2 should not overlap
+        <chr_constraint> disjunct(+int, +int, +int) #cpp_private
+        // Posts a new disjunct constraint
+        <chr_constraint> post_disjunct(+int, +int)
+        // - DISJUNCT_WEEKLY(WeeklyId1, WeeklyId2)
+        // Sessions from WeeklyId1 and WeeklyId2 should not overlap
+        <chr_constraint> disjunct_weekly(+int, +int), post_disjunct_weekly(+int, +int)
+
+        // - SAME_ROOM(SRoom, SessionID)
+        // All the SessionIDs from the same SRoom should takes place in the same room
+        <chr_constraint> same_room(+int, +int) #cpp_private
+
+        // - SAME_TEACHERS(STeachers, SessionID)
+        // All the SessionIDs from the same STeachers should have the same teachers
+        <chr_constraint> same_teachers(+int, +int) #cpp_private
+
+        // - SAME_START(SStart, SessionID)
+        // All SessionIDs from the same STime should start at the same time
+        <chr_constraint> same_start(+int, +int) #cpp_private
+
+        // - SAME_DAYS(SDays, SessionID)
+        // All SessionIDs from the same SDays should start the same slot of the week
+        <chr_constraint> same_days(-intvar, +int) #cpp_private
+
+        // - SAME_WEEK(SWeekDiv, SessionID)
+        // All SessionIDs from the same SWeekDiv should start the same week
+        <chr_constraint> same_week(-intvar, +int) #cpp_private
+
+        // - WEEKLY
+        // In the XML model, weekly is associated with a set of session
+        // In the CHR model, a pair of shifts is posted:
+        // SESSION_SHIFT(SessionId1, SessionId2, Offset)
+        <chr_constraint> session_shift(+int, +int, +int)
+        // In order to simplify the problem, we still post weekly constraint:
+        // WEEKLY(WeeklyId, FirstSessionId)
+        // WEEKLY_SESSION(WeeklyId, SessionId)
+        <chr_constraint> weekly(+int, +int), weekly_session(+int, +int)
+
+        // - FORBIDDEN_SLOT(SessionId, FirstSlot, LastSlot)
+        // The SessionId should not take place between First and Last slots
+        <chr_constraint> forbidden_slot(+int, +int, +int) #cpp_private
+
+        // - ATMOST_SLOTS(AtMostId, Threshold, FilterMin, FilterMax)
+        // Defines an atMost slots constraint
+        // No more than Threshold sessions should take place between the time window between slots FilterMin and FilterMax
+        <chr_constraint> atmost_slots(+int, +int, +int, +int) #cpp_private
+        // - ATMOST_SESSION_SLOTS(AtMostId, SessionId)
+        // Links a Session with an atMost slots constraint
+        // An 'atmost_session_slots' session is a session that could be in the time window
+        // If a session cannot be in the time window, it is removed
+        // If a session is totally in the time window, it is removed and the threshold is rectified
+        <chr_constraint> atmost_session_slots(+int, +int) #cpp_private
+
+        // - CAPACITY(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVariables)
+        // Defines a capacity constraint
+        // No less than CapacityMin and no more that CapacityMax variables should have the defined value
+        // Count is the number of singletons linked to the constraint
+        // CountEqual is the number of singleton variables affected to Value
+        // NbVariables is the number of variables linked to the capacity constraint
+        <chr_constraint> capacity(+int, +int, +int, +int, +int, +int, +int)
+        // - CAPACITY_VAR(CapacityId, Variable)
+        // Tags a variable and links it with a capacity constraint
+        // A tagged variable is a variable that is not fixed yet (not singleton)
+        <chr_constraint> capacity_var(+int, -intvar)
+
+
+        // - NOT_SAME_ROOM_SAME_TIME(Session1, Session2)
+        // Two sessions in the same room must not occur at the same time (except if same class!)
+        <chr_constraint> not_same_room_same_time(+int,+int) #cpp_private
+
+        // - NOT_SAME_TEACHER_SAME_TIME(Session1, Session2)
+        // Two sessions with the same teacher must not occur at the same time (except if same class!)
+        <chr_constraint> not_same_teacher_same_time(+int,+int) #cpp_private
+
+        // -------------------------------------------------------------------------------
+        // PROBLEM CONDITIONAL CONSTRAINTS
+        // - ATMOST_TEACHER_SLOTS(AtMostTeacherId, Threshold, FilterMin, FilterMax, TeacherId)
+        // Defines an atMost slots constraint conditioned by the Teacher value
+        // No more than Threshold sessions should take place between the time window between slots FilterMin and FilterMax
+        // IF they are assigned to the teacher TeacherId
+        <chr_constraint> atmost_teacher_slots(+int, +int, +int, +int, +int) #cpp_private
+        // - ATMOST_TEACHER_SESSION_SLOTS(AtMostTeacherId, SessionId)
+        // Links a Session with an atMostTeacher slots constraint
+        // An 'atmost_teacher_session_slots' session is a session that could be in the time window
+        // If a session is not assigned to the teacher, it is removed
+        // If a session cannot be in the time window, it is removed
+        // If a session is totally in the time window AND assigned to the teacher, it is removed and the threshold is rectified
+        <chr_constraint> atmost_teacher_session_slots(+int, +int) #cpp_private
+
+        // -------------------------------------------------------------------------------
+        // LABELING
+        <chr_constraint> go()
+        <chr_constraint> labeling_disjunct(+int, +int)
+        <chr_constraint> next_disjunct_id(+int)
+        <chr_constraint> first_disjunct_id(+int)
+        <chr_constraint> labeling_same_attendees()
+        <chr_constraint> labeling_same_attendees_total_order(+int, +std::vector<int>)
+        <chr_constraint> labeling_rooms(+int), labeling_group_rooms(+int, +int)
+        <chr_constraint> labeling_not_same_room_same_time(+int)
+        <chr_constraint> labeling_teachers(+int), labeling_n_teacher(+int, +int)
+        <chr_constraint> labeling_not_same_teacher_same_time(+int)
+        <chr_constraint> labeling_slots(+int)
+
+        // DEBUG
+        <chr_constraint> state(+int)
+
+
+        //////////////////////////////////////////////
+        //                                          //
+        // CONSTRAINT DEFINITIONS                   //
+        //                                          //
+        //////////////////////////////////////////////
+	
+        // -------------------------------------------------------------------------------
+        // SESSION SLOTS MANAGEMENT
+        stop_session_slot @
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength),
+            state(State) #passive
+        [self,std]<=>
+            (*SessionStartSlot).empty() // empty domain
+            ||
+            (*SessionEndSlot).empty() // empty domain
+            |
+            //failure()
+            self.debugFailure(*State, "slot " + std::to_string(SessionId) + " empty")
+        ;;
+
+        // Length=1 means Start=End
+        post_session_length_eq_1 @
+            post_session_slot(SessionId, SessionStartSlot, SessionEndSlot, 1)
+        <=>
+            SessionStartSlot %= SessionEndSlot,
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, 1)
+        ;;
+
+        // We have to make sure that :
+        // Start + Length-1 = End
+        // and
+        // Start and End are the same day
+        post_session_length_gt_1 @
+            post_session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength)
+        [self]<=>
+            CP::Int::plus(SessionStartSlot, (*SessionLength)-1, SessionEndSlot),
+            // we restrict only the start,
+            // the propagation rule will propagate it to the end
+            moduloStart = chr::Logical_var_mutable(intvar(0, self.m_slotsPerDay-(*SessionLength))),
+            CP::Int::modulo(SessionStartSlot, self.m_slotsPerDay, moduloStart),
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength)
+        ;;
+
+        // prop_session_length_eq_1  : nothing to do
+
+        // We propagate the link 'Start + Length-1 = End'
+        prop_session_length_gt_1 @
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength)
+        [self]=>>
+            (*SessionLength) > 1
+            |
+            CP::Int::plus(SessionStartSlot, (*SessionLength)-1, SessionEndSlot)
+        ;;
+
+        set_session_slot @
+            session(SessionId, ClassId, SessionIndex) #passive,
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength) #passive,
+            set_session_slot(ClassId, SessionIndex, StartSlot)
+        [CP]==>
+            CP::Int::eq(SessionStartSlot, *StartSlot)
+        ;;
+
+        // If a group has already a session fixed, no other sessions can occur during the first one
+        prop_session_slot_same_group @
+            session_slot(Session1, Start1, End1, Length1),
+            session_slot(Session2, Start2, End2, Length2) #passive,
+            session_group_room(Session1, Group, Room1),
+            session_group_room(Session2, Group, Room2)
+        [CP]==>
+            (*Start1).singleton(),
+            (*End1).singleton()
+            |
+            CP::Int::ne(Start2, (*Start1).val(), (*End1).val())
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // SESSION ROOMS MANAGEMENT
+
+        // Can't have 'no room'
+        stop_session_group_room_empty @
+            session_group_room(SessionId, GroupId, Room),
+            state(State) #passive
+        [self]<=>
+            (*Room).empty()
+            |
+            //failure()
+            self.debugFailure(*State, "room empty")
+        ;;
+
+
+        // -------------------------------------------------------------------------------
+        // ROOM CAPACITY MANAGEMENT
+
+        // If the room overflows, we fail
+        stop_room_capacity_overflow @
+            room_capacity(RoomId, RoomCapacity),
+            room_space_occupied(RoomId, SessionId, Occupied),
+            state(State) #passive
+        [self]<=>
+            (*RoomCapacity) < (*Occupied)
+            |
+            //failure()
+            self.debugFailure(*State, "room overflow")
+        ;;
+
+        post_room_space_occupied @
+            session(SessionId, ClassId, SessionIndex),
+            class_group(ClassId, GroupId, GroupIndex),
+            group_size(GroupId, GroupSize),
+            session_group_room(SessionId, GroupId, Room)
+        ==>
+            (*Room).singleton()
+            |
+            room_space_occupied((*Room).val(), SessionId, *GroupSize)
+        ;;
+
+        // The room space has been update,
+        // We propagate the information to other rooms of the class to update their domain
+        propagate_room_space_occupied @
+            room_space_occupied(RoomId, SessionId, Occupied),
+            room_capacity(RoomId, Capacity),
+            session(SessionId, ClassId, SessionIndex),
+            class_group(ClassId, GroupId, GroupIndex),
+            session_group_room(SessionId, GroupId, Room),
+            group_size(GroupId2, GroupSize)
+        [CP]==>
+            (*Capacity) < (*Occupied) + (*GroupSize),
+            !(*Room).singleton()
+            |
+            CP::Int::ne(Room, *RoomId)
+        ;;
+
+        // If there is two room_space_occupied for the same (room, session)
+        // we should add them
+        propagate_room_space_occupied_add @
+            room_space_occupied(RoomId, SessionId, Occupied1),
+            room_space_occupied(RoomId, SessionId, Occupied2) #passive
+        <=>
+            room_space_occupied(RoomId, SessionId, *Occupied1 + *Occupied2)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // SESSION TEACHERS MANAGEMENT
+
+        // Can't have 'no teacher'
+        stop_session_teacher_empty @
+            session_teacher(SessionId, TeacherIndex, Teacher),
+            state(State) #passive
+        [self]<=>
+            (*Teacher).empty()
+            |
+            //failure()
+            self.debugFailure(*State, "teacher empty")
+        ;;
+
+        // Can't have the same teacher twices for the same session
+        stop_session_teacher_duplicate @
+            session_teacher(SessionId, TeacherIndex1, Teacher1),
+            session_teacher(SessionId, TeacherIndex2, Teacher2) #passive,
+            state(State) #passive
+        [self]<=>
+            (*Teacher1).singleton(),
+            (*Teacher2).singleton(),
+            (*Teacher1).val() == (*Teacher2).val()
+            |
+            //failure()
+            self.debugFailure(*State, "teacher duplicate")
+        ;;
+
+        set_session_teacher @
+            session(SessionId, ClassId, SessionIndex) #passive,
+            session_teacher(SessionId, TeacherIndex, Teacher) #passive,
+            set_session_teacher(ClassId, SessionIndex, TeacherIndex, TeacherId)
+        [CP]==>
+            CP::Int::eq(Teacher, *TeacherId)
+        ;;
+
+        // Two sessions with the same teacher must not occur at the same time
+        two_sessions_same_teacher @
+            session(Session1, Class1, Index1),
+            session(Session2, Class2, Index2) #passive,
+            session_teacher(Session1, TeacherIndex1, Teacher1),
+            session_teacher(Session2, TeacherIndex2, Teacher2) #passive
+        [self,std]==>
+            (*Teacher1).singleton(),
+            (*Teacher2).singleton(),
+            (*Teacher1).val() == (*Teacher2).val()
+            |
+            self.debug("two_sessions_same_teacher("+std::to_string(*Session1)+", "+std::to_string(*Session2)+")"),
+            post_disjunct(Session1, Session2)
+        ;;
+
+        // If a teacher is already assigned, the two sessions should not occur at the same time
+        // If one of the two sessions is fixed, the information is propagated
+        prop_teacher_slot @
+            session_slot(Session1, Start1, End1, Length1),
+            session_slot(Session2, Start2, End2, Length1) #passive,
+            session_teacher(Session1, TeacherIndex1, Teacher1),
+            session_teacher(Session2, TeacherIndex2, Teacher2) #passive
+        [CP,self,std]==>
+            (*Teacher1).singleton(),
+            (*Teacher2).singleton(),
+            (*Teacher1).val() == (*Teacher2).val(),
+            (*Start1).singleton(),
+            (*End1).singleton()
+            |
+            self.debug("prop_teacher_slot "+std::to_string(*Session1)+" "+std::to_string(*Session2)),
+            CP::Int::ne(Start2, (*Start1).val(), (*End1).val())
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // MANAGE PRECEDENCE BETWEEN SESSIONS
+        // - PRECEDENCE(SessionID1, SessionID2)
+        // SessionID1 should takes place before SessionID2
+
+        // A session cannot be before itself
+        precedence_failure_0 @
+            precedence(Session, Session),
+            state(State) #passive
+        [self]<=>
+            //failure()
+            self.debugFailure(*State, "prec(S,S)")
+		;;
+	
+		// A session cannot be before AND after another one
+        precedence_failure_1 @
+			precedence(Session1, Session2),
+            precedence(Session2, Session1),
+            state(State) #passive
+        [self]<=>
+            //failure()
+            self.debugFailure(*State, "prec(S1, S2) prec(S2, S1)")
+		;;
+	
+		// Remove duplicate precedence() constraints
+        precedence_dup @
+            precedence(Session1, Session2) #passive
+			\
+            precedence(Session1, Session2)
+		<=>
+            success()
+		;;
+
+        precedence_transitivity @
+            precedence(Session1, Session2),
+            precedence(Session2, Session3)
+        ==>
+            precedence(Session1, Session3)
+        ;;
+
+        // Create precedence constraint if there is a session_shift
+        precedence_session_shift @
+            session_shift(SessionId1, SessionId2, Offset)
+        ==>
+            precedence(SessionId1, SessionId2)
+        ;;
+
+        // Create precedence constraint among session_shift constraints
+        precedence_session_shifts @
+            precedence(SessionAId1, SessionBId1),
+            session_shift(SessionAId1, SessionAId2, Offset),
+            session_shift(SessionBId1, SessionBId2, Offset)
+        ==>
+            precedence(SessionAId2, SessionBId2)
+        ;;
+
+        // Propagate the precedence constraint if they are also involved in a same_days constraint
+        prop_precedence_same_days @
+            precedence(SessionId1, SessionId2),
+            session_slot(SessionId1, StartSlot1, EndSlot1, Length1),
+            session_slot(SessionId2, StartSlot2, EndSlot2, Length2),
+            same_days(SDaysModulo, SessionId1),
+            same_days(SDaysModulo, SessionId2)
+        [CP,self]=>>
+            CP::Int::le(StartSlot1, (*StartSlot2).max()-self.m_slotsPerWeek),
+            CP::Int::ge(StartSlot2, (*StartSlot1).min()+self.m_slotsPerWeek)
+        ;;
+
+        // Propagate the precedence constraint to the two involved session
+        prop_precedence @
+            precedence(Session1, Session2),
+            session_slot(Session1, StartSlot1, EndSlot1, Length1),
+            session_slot(Session2, StartSlot2, EndSlot2, Length2)
+        [CP]=>> // propagator without history: each time a session is modified it has to satisfy the constraint
+            (((*EndSlot1).min() >= (*StartSlot2).min()) || ((*EndSlot1).max() >= (*StartSlot2).max()))
+            |
+            CP::Int::lt(EndSlot1, StartSlot2)
+        ;;
+
+        post_precedence @
+            session_slot(Session1, StartSlo1, EndSlot1, Lenght1),
+            session_slot(Session2, StartSlot2, EndSlot2, Length2)
+        ==>
+            (*EndSlot1).max() < (*StartSlot2).min()
+            |
+            precedence(Session1, Session2)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // MANAGE SESSION ROOMS
+
+        // - SAME_ROOM(SRoom, SessionID)
+        // All the SessionIDs from the same SRoom should takes place in the same room
+        post_same_room @
+            session_group_room(Session1, Group1, Room1),
+            session_group_room(Session2, Group2, Room2) #passive,
+            same_room(SRoom, Session1),
+            same_room(SRoom, Session2) #passive
+        ==> // propagator with history, this one should be called only once because of the unification
+            Room1 %= Room2
+        ;;
+
+
+        // Two sessions (from different class!) in the same room must not occur at the same time
+        two_sessions_same_room @
+            session(Session1, Class1, Index1),
+            session(Session2, Class2, Index2) #passive,
+            session_group_room(Session1, Group1, Room1),
+            session_group_room(Session2, Group2, Room2) #passive
+        [self,std]==>
+            (*Class1) != (*Class2),
+            (*Room1).singleton(),
+            (*Room2).singleton(),
+            (*Room1).val() == (*Room2).val()
+            |
+            self.debug("two_sessions_same_room("+std::to_string(*Session1)+", "+std::to_string(*Session2)+")"),
+            post_disjunct(Session1, Session2)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // SAME_START(SStart, SessionID)
+        // All SessionIDs from the same STime should start at the same time
+
+        post_same_start @
+            session_slot(Session1, StartSlot1, EndSlot1, Length1) #passive,
+            session_slot(Session2, StartSlot2, EndSlot2, Length2) #passive,
+            same_start(SStart, Session1),
+            same_start(SStart, Session2) #passive
+        ==> // propagator with history, this one should be called only once because of the unification
+            StartSlot2 %= StartSlot1
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // SAME_DAYS(SDaysModulo, SessionID)
+        // All SessionIDs from the same SDaysModulo should start the same slot of the week
+
+        stop_same_days @
+            same_days(SDaysModulo, Session),
+            state(State) #passive
+        [self]<=>
+            (*SDaysModulo).empty()
+            |
+            //failure()
+            self.debugFailure(*State, "same_days empty")
+        ;;
+
+        prop_same_days @
+            same_days(SDaysModulo, Session),
+            session_slot(Session, StartSlot, EndSlot, Length)
+        [self,CP]=>> // propagator without history: each time a session is modified it has to satisfy the constraint
+            CP::Int::modulo_boundConsistency(StartSlot, self.m_slotsPerWeek, SDaysModulo)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // - SAME_WEEK(SWeekDiv, SessionID)
+        // All SessionIDs from the same SWeekDiv should start the same week
+
+        stop_same_week @
+            same_week(SWeekDiv, Session),
+            state(State) #passive
+        [self]<=>
+            (*SWeekDiv).empty()
+            |
+            //failure()
+            self.debugFailure(*State, "same_week empty")
+        ;;
+
+        prop_same_week @
+            same_week(SWeekDiv, Session),
+            session_slot(Session, StartSlot, EndSlot, Length)
+        [self,CP]=>> // propagator without history: each time a session is modified it has to satisfy the constraint
+            CP::Int::div_boundConsistency(StartSlot, self.m_slotsPerWeek, SWeekDiv)
+        ;;
+
+
+        // -------------------------------------------------------------------------------
+        // - WEEKLY
+        // In the XML model, weekly is associated with a set of session
+        // In the CHR model, a pair of shifts is posted:
+        // SESSION_SHIFT(SessionId1, SessionId2, Offset)
+        prop_session_shift @
+            session_slot(SessionId1, StartSlot1, EndSlot1, Length1),
+            session_slot(SessionId2, StartSlot2, EndSlot2, Length2),
+            session_shift(SessionId1, SessionId2, Offset)
+        [CP]=>> // propagator without history: each time a session is modified it has to satisfy the constraint
+            CP::Int::shift_boundConsistency(StartSlot1, StartSlot2, Offset)
+        ;;
+
+
+        // -------------------------------------------------------------------------------
+        // - FORBIDDEN_SLOT(SessionId, FirstSlot, LastSlot)
+        // The SessionId should not take place between First and Last slots
+
+        post_forbidden_slot @
+            session_slot(SessionId, StartSlot, EndSlot, Length)
+            \
+            forbidden_slot(SessionId, FirstSlot, LastSlot)
+        [CP]<=>
+            CP::Int::ne(StartSlot, *FirstSlot - *Length+1, *LastSlot),
+            CP::Int::ne(EndSlot, *FirstSlot, *LastSlot + *Length-1)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // MANAGE ATMOST_SLOTS
+
+        // Too many sessions in the time window!
+        stop_atmost_slots_failed @
+            atmost_slots(AtMostId, Threshold, FilterMin, FilterMax),
+            state(State) #passive
+        [self]<=>
+            ((*Threshold) < 0)
+            |
+            //failure()
+            self.debugFailure(*State, "atmost_slots overflow")
+        ;;
+
+        // We reached the maximum of sessions in the time window
+        // All the remaining sessions should not take place in the time window
+        prop_atmost_slots_down @
+            atmost_slots(AtMostId, 0, FilterMin, FilterMax),
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength) #passive
+            \
+            atmost_session_slots(AtMostId, SessionId)
+        [CP]<=>
+            CP::Int::notin_range(SessionStartSlot, FilterMin, FilterMax),
+            CP::Int::notin_range(SessionEndSlot, FilterMin, FilterMax)
+        ;;
+
+        // The session can not be in the time window anymore, we remove it
+        prop_atmost_slots_up_remove_out_of_range @
+            atmost_slots(AtMostId, Threshold, FilterMin, FilterMax) #passive,
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength)
+            \
+            atmost_session_slots(AtMostId, SessionId)
+        <=>
+            (*SessionEndSlot).max() < *FilterMin
+                ||
+            *FilterMax < (*SessionStartSlot).min()
+            |
+            success()
+        ;;
+
+        // The session is fixed and overlaps the time window, or is totally inside the time window
+        // We remove the session and modify the threshold in consequence
+        repost_atmost_slots_up_modify_threshold @
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength)
+            \
+            atmost_slots(AtMostId, Threshold, FilterMin, FilterMax),
+            atmost_session_slots(AtMostId, SessionId)
+        [self]<=>
+            (   // session is fixed, and overlaps the time window
+                (*SessionStartSlot).singleton()
+                &&
+                ((*SessionEndSlot).val() >= *FilterMin)
+                &&
+                ((*SessionStartSlot).val() <= *FilterMax)
+            )
+            ||
+            (   // session is fully included in the time window
+                ((*SessionStartSlot).min() >= *FilterMin)
+                &&
+                ((*SessionEndSlot).max() <= *FilterMax)
+            )
+            |
+            newThreshold = *Threshold - self.nbOverlapSlots(*SessionStartSlot, *SessionEndSlot, *SessionLength, *FilterMin, *FilterMax),
+            atmost_slots(AtMostId, newThreshold, FilterMin, FilterMax)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // MANAGE ATMOST_TEACHER_SLOTS
+
+        // Too many sessions in the time window!
+        stop_atmost_teacher_slots_failed @
+            atmost_teacher_slots(AtMostTeacherId, Threshold, FilterMin, FilterMax, TeacherId),
+            state(State) #passive
+        [self]<=>
+            ((*Threshold) < 0)
+            |
+            //failure()
+            self.debugFailure(*State, "atmost_teacher overflow")
+        ;;
+
+        // We reached the maximum of sessions in the time window
+        // If the teacher is assigned: (prop_atmost_teacher_slots_down)
+        // All the remaining sessions should not take place in the time window
+        // Else: (prop_atmost_teacher_down)
+        // The teacher should not be selected for those sessions
+        prop_atmost_teacher_slots_down @
+            atmost_teacher_slots(AtMostTeacherId, 0, FilterMin, FilterMax, TeacherId),
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength) #passive,
+            session_teacher(SessionId, TeacherIndex, Teacher)
+            \
+            atmost_teacher_session_slots(AtMostTeacherId, SessionId)
+        [CP]<=>
+            (*Teacher).singleton() && (*Teacher).val() == *TeacherId
+            |
+            CP::Int::notin_range(SessionStartSlot, FilterMin, FilterMax),
+            CP::Int::notin_range(SessionEndSlot, FilterMin, FilterMax)
+        ;;
+        prop_atmost_teacher_down @
+            atmost_teacher_slots(AtMostTeacherId, 0, FilterMin, FilterMax, TeacherId),
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength) #passive,
+            session_teacher(SessionId, TeacherIndex, Teacher)
+            \
+            atmost_teacher_session_slots(AtMostTeacherId, SessionId)
+        [CP]<=>
+            (   // session is fixed, overlaps the time window, and the teacher is not assigned
+                (*SessionStartSlot).singleton()
+                &&
+                ((*SessionEndSlot).val() >= *FilterMin)
+                &&
+                ((*SessionStartSlot).val() <= *FilterMax)
+                &&
+                !(*Teacher).singleton()
+            )
+            ||
+            (   // session is fully included in the time window and the teacher is not assigned
+                ((*SessionStartSlot).min() >= *FilterMin)
+                &&
+                ((*SessionEndSlot).max() <= *FilterMax)
+                &&
+                !(*Teacher).singleton()
+            )
+            |
+            CP::Int::ne(Teacher, *TeacherId)
+        ;;
+
+        // The session can not be in the time window anymore, we remove it
+        prop_atmost_teacher_slots_up_remove_out_of_range @
+            atmost_teacher_slots(AtMostTeacherId, Threshold, FilterMin, FilterMax, TeacherId) #passive,
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength)
+            \
+            atmost_teacher_session_slots(AtMostTeacherId, SessionId)
+        <=>
+            (*SessionEndSlot).max() < *FilterMin
+                ||
+            *FilterMax < (*SessionStartSlot).min()
+            |
+            success()
+        ;;
+
+        // The session is not associated with the teacher, we remove it
+        prop_atmost_teacher_slots_up_remove_teacher @
+            atmost_teacher_slots(AtMostTeacherId, Threshold, FilterMin, FilterMax, TeacherId) #passive,
+            session_teacher(SessionId, TeacherIndex, Teacher)
+            \
+            atmost_teacher_session_slots(AtMostTeacherId, SessionId)
+        <=>
+            !(*Teacher).in(*TeacherId)
+            |
+            success()
+        ;;
+
+        // The session is fixed, the teacher assigned and overlaps the time window, or is totally inside the time window
+        // We remove the session and modify the threshold in consequence
+        repost_atmost_teacher_slots_up_modify_threshold @
+            session_slot(SessionId, SessionStartSlot, SessionEndSlot, SessionLength),
+            session_teacher(SessionId, TeacherIndex, Teacher)
+            \
+            atmost_teacher_slots(AtMostTeacherId, Threshold, FilterMin, FilterMax, TeacherId),
+            atmost_teacher_session_slots(AtMostTeacherId, SessionId)
+        [self]<=>
+            (   // session is fixed, overlaps the time window, and the teacher is assigned
+                (*SessionStartSlot).singleton()
+                &&
+                ((*SessionEndSlot).val() >= *FilterMin)
+                &&
+                ((*SessionStartSlot).val() <= *FilterMax)
+                &&
+                ((*Teacher).singleton() && (*Teacher).val() == *TeacherId)
+            )
+            ||
+            (   // session is fully included in the time window and the teacher is assigned
+                ((*SessionStartSlot).min() >= *FilterMin)
+                &&
+                ((*SessionEndSlot).max() <= *FilterMax)
+                &&
+                ((*Teacher).singleton() && (*Teacher).val() == *TeacherId)
+            )
+            |
+            newThreshold = *Threshold - self.nbOverlapSlots(*SessionStartSlot, *SessionEndSlot, *SessionLength, *FilterMin, *FilterMax),
+            atmost_teacher_slots(AtMostTeacherId, newThreshold, FilterMin, FilterMax, TeacherId)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // MANAGE TEACHERS
+
+        // - SAME_TEACHERS(STeachers, SessionID)
+        // All the SessionIDs from the same STeachers should have the same teachers
+        // Meaning that the same indexed teacher should be the same
+        post_same_teachers @
+            session_teacher(SessionId1, TeacherIndex, Teacher1),
+            session_teacher(SessionId2, TeacherIndex, Teacher2) #passive,
+            same_teachers(STeachers, SessionId1),
+            same_teachers(STeachers, SessionId2) #passive
+        ==> // propagator with history, this one should be called only once because of the unification
+            Teacher1 %= Teacher2
+        ;;
+
+
+        // -------------------------------------------------------------------------------
+        // MANAGE CAPACITY
+
+        // It's not possible to have more values than CountMax
+        capacity_overflow @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVars),
+            state(State) #passive
+        [self]<=>
+            (*CountEqual) > (*CapacityMax)
+            |
+            //failure()
+            self.debugFailure(*State, "capacity overflow")
+        ;;
+
+        // There is not enough variables left to have CapacityMin values
+        capacity_underflow @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVars),
+            state(State) #passive
+        [self]<=>
+            (*NbVars)-(*Count) < (*CapacityMin)-(*CountEqual)
+            |
+            //failure()
+            self.debugFailure(*State, "capacity underflow")
+        ;;
+
+        // If a variable is now a singleton,
+        // and its value is Value,
+        // we increase the Count and the CountEqual
+        capacity_var_singleton_equal @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVars),
+            capacity_var(CapacityId, Var)
+        [self]<=>
+            (*Var).singleton(),
+            (*Var).val() == (*Value)
+            |
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count+1, CountEqual+1, NbVars)
+        ;;
+
+        // If a variable is now a singleton,
+        // and its value is not the Value,
+        // we increase the Count but not the CountEqual
+        capacity_var_singleton_diff @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVars),
+            capacity_var(CapacityId, Var)
+        [self]<=>
+            (*Var).singleton(),
+            (*Var).val() != (*Value)
+            |
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count+1, CountEqual, NbVars)
+        ;;
+
+        // If the number of remaining variables is the same as the number of values needed,
+        // we can propagate that the domain of the remaining variables should be the value
+        prop_capacity_min @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVars)
+            \
+            capacity_var(CapacityId, Var)
+        [CP]<=>
+            (*CountEqual) < (*CapacityMin),
+            (*CapacityMin)-(*CountEqual) == (*NbVars)-(*Count)
+            |
+            CP::Int::eq(Var, *Value)
+        ;;
+
+        // If the number of values is reached,
+        // all the remaining variables should not be Value
+        // Once the propagation is done, no need to keep the constraint
+        prop_capacity_max @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, Count, CountEqual, NbVars)
+            \
+            capacity_var(CapacityId, Var)
+        [CP]<=>
+            (*CountEqual) == (*CapacityMax)
+            |
+            CP::Int::ne(Var, *Value)
+        ;;
+
+        // Count == NbVars : meaning that all the variables linked to the constraint are singletons
+        // Once we fixed all the domains of the variables, and that the capacity constraint is satisfied, we can delete the constraint
+        capacity_success @
+            capacity(CapacityId, Value, CapacityMin, CapacityMax, NbVars, CountEqual, NbVars)
+        <=>
+            (*CapacityMin) <= (*CountEqual) && (*CountEqual) <= (*CapacityMax)
+            |
+            success()
+        ;;
+	
+		// -------------------------------------------------------------------------------
+		// -------------------------------------------------------------------------------
+        // - LABELING
+		// -------------------------------------------------------------------------------
+        // -------------------------------------------------------------------------------
+
+        go @
+            nr_sessions(S)
+            \
+            go()
+        [self]<=>
+            self.generate_group_same_attendees(),
+            // ML TEST
+            //labeling_disjunct(0, 1)
+            labeling_rooms(*S-1)
+            // END ML TEST
+        ;;
+
+        end_disjunct_groups @
+            nr_sessions(S),
+            next_disjunct_id(NextDisjunctId) #passive
+            \
+            labeling_disjunct(NextDisjunctId, 1),
+            state(State) #passive
+        [self]<=>
+            self.nextState(*State),
+            state(*State+1),
+            labeling_rooms(S-1)
+        ;;
+
+        end_disjunct_rooms @
+            nr_sessions(S),
+            next_disjunct_id(NextDisjunctId) #passive
+            \
+            labeling_disjunct(NextDisjunctId, 2),
+            state(State) #passive
+        [self]<=>
+            self.nextState(*State),
+            state(*State+1),
+            labeling_teachers(S-1)
+        ;;
+
+        end_disjunct_teachers @
+            nr_sessions(S),
+            next_disjunct_id(NextDisjunctId) #passive
+            \
+            labeling_disjunct(NextDisjunctId, 3),
+            state(State) #passive
+        [self]<=>
+            self.nextState(*State),
+            state(*State+1),
+            labeling_slots(S-1)
+        ;;
+
+        post_disjunct_same_start @
+            same_start(SStart, Session1) #passive,
+            same_start(SStart, Session2) #passive,
+            post_disjunct(Session1, Session2),
+            state(State) #passive
+        [self]<=>
+            self.debugFailure(*State, "disjunct same")
+        ;;
+
+        post_disjunct_weekly_dup_12 @
+            post_disjunct_weekly(WeeklyId1, WeeklyId2)
+            \
+            post_disjunct_weekly(WeeklyId1, WeeklyId2)
+        <=>
+            success()
+        ;;
+
+        post_disjunct_weekly_dup_21 @
+            post_disjunct_weekly(WeeklyId1, WeeklyId2)
+            \
+            post_disjunct_weekly(WeeklyId2, WeeklyId1)
+        <=>
+            success()
+        ;;
+
+        disjunct_weekly @
+            post_disjunct_weekly(WeeklyId1, WeeklyId2)
+        [self]<=>
+            self.postDisjunctWeekly(*WeeklyId1, *WeeklyId2)
+        ;;
+
+        // We don't post already arbitrated disjunctions
+        post_disjunct_prec_12 @
+            precedence(SessionId1, SessionId2)
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            self.debug("post_disjunct_prec_12 post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        post_disjunct_prec_21 @
+            precedence(SessionId2, SessionId1)
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            self.debug("post_disjunct_prec_21 post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        // We don't post already existing disjunctions
+        post_disjunct_dup_post_12 @
+            post_disjunct(SessionId1, SessionId2) #passive
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            self.debug("post_disjunct_dup_post_12 post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        post_disjunct_dup_post_21 @
+            post_disjunct(SessionId2, SessionId1) #passive
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            self.debug("post_disjunct_dup_post_21 post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        post_disjunct_dup_12 @
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            self.debug("post_disjunct_dup_12 post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        post_disjunct_dup_21 @
+            disjunct(DisjunctId, SessionId2, SessionId1) #passive
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            self.debug("post_disjunct_dup_21 post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        // We keep only disjunctd between the first session of a weekly and other sessions of an other weekly
+        post_disjunct_weekly @
+            weekly(WeeklyId1, FirstSessionId1),
+            weekly_session(WeeklyId1, SessionId1),
+            weekly(WeeklyId2, FirstSessionId2),
+            weekly_session(WeeklyId2, SessionId2)
+            \
+            post_disjunct(SessionId1, SessionId2)
+        [self,std]<=>
+            (*FirstSessionId1 != *SessionId1) && (*FirstSessionId2 != *SessionId2)
+            //(*FirstSessionId1 != *SessionId1) || (*FirstSessionId2 != *SessionId2)
+            |
+            self.debug("post_disjunct_weekly post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            post_disjunct_weekly(WeeklyId1, WeeklyId2)
+            //post_disjunct(*FirstSessionId1, *FirstSessionId2)
+        ;;
+
+
+        post_disjunct @
+            post_disjunct(SessionId1, SessionId2),
+            next_disjunct_id(DisjunctId) #passive
+        [self,std]<=>
+            next_disjunct_id(*DisjunctId+1),
+            self.debug("post_disjunct post_disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            disjunct(DisjunctId, SessionId1, SessionId2)
+        ;;
+
+        trivial_disjunct_12 @
+            precedence(SessionId1, SessionId2)
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive
+        [self,std]<=>
+            self.debug("trivial_disjunct_12 disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        trivial_disjunct_21 @
+            precedence(SessionId2, SessionId1)
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive
+        [self,std]<=>
+            self.debug("trivial_disjunct_21 disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            success()
+        ;;
+
+        trivial_disjunct_detect @
+            precedence(SessionId1, SessionId2) #passive,
+            session_slot(SessionId1, Start1, End1, Length1) #passive,
+            session_slot(SessionId2, Start2, End2, Length2) #passive
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive,
+            labeling_disjunct(DisjunctId, LabelingStep)
+        [self,std]<=>
+            (*End1).max() < (*Start2).min() || (*End2).max() < (*Start1).min()
+            |
+            self.debug("trivial_disjunct_detect disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            labeling_disjunct(DisjunctId+1, LabelingStep)
+        ;;
+
+        // If in a disjunct, one slot is already fixed, we juste remove its slots from the second session domain
+        resolv_disjunct_singleton1 @
+            session_slot(SessionId1, SessionStart1, SessionEnd1, SessionLength1),
+            session_slot(SessionId2, SessionStart2, SessionEnd2, SessionLength2) #passive
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2)
+        [CP,self,std]<=>
+            (*SessionStart1).singleton(),
+            (*SessionEnd1).singleton()
+            |
+            CP::Int::ne(SessionStart2, (*SessionStart1).val()-(*SessionLength2)+1, (*SessionEnd1).val())
+        ;;
+
+        // If in a disjunct, one slot is already fixed, we juste remove its slots from the second session domain
+        resolv_disjunct_singleton2 @
+            session_slot(SessionId1, SessionStart1, SessionEnd1, SessionLength1) #passive,
+            session_slot(SessionId2, SessionStart2, SessionEnd2, SessionLength2)
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2)
+        [CP,self,std]<=>
+            (*SessionStart2).singleton(),
+            (*SessionEnd2).singleton()
+            |
+            CP::Int::ne(SessionStart1, (*SessionStart2).val()-(*SessionLength1)+1, (*SessionEnd2).val())
+        ;;
+
+        // We try to resolv disjunct by putting the session with the lowest value first
+        resolv_disjunct_Start1_lt_Start2 @
+            session_slot(SessionId1, SessionStart1, SessionEnd1, SessionLength1) #passive,
+            session_slot(SessionId2, SessionStart2, SessionEnd2, SessionLength2) #passive
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive,
+            labeling_disjunct(DisjunctId, LabelingStep)
+        [self,std]<=>
+            (*SessionStart1).min() < (*SessionStart2).min()
+            |
+            self.debug("resolv_disjunct_Start1_lt_Start2 disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+                precedence(SessionId1, SessionId2),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+            ;
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId2)+", "+std::to_string(*SessionId1)+")"),
+                precedence(SessionId2, SessionId1),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+        ;;
+
+        // We try to resolv disjunct by putting the session with the lowest value first
+        resolv_disjunct_Start1_gt_Start2 @
+            session_slot(SessionId1, SessionStart1, SessionEnd1, SessionLength1) #passive,
+            session_slot(SessionId2, SessionStart2, SessionEnd2, SessionLength2) #passive
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive,
+            labeling_disjunct(DisjunctId, LabelingStep)
+        [self,std]<=>
+            (*SessionStart1).min() > (*SessionStart2).min()
+            |
+            self.debug("resolv_disjunct_Start1_gt_Start2 disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId2)+", "+std::to_string(*SessionId1)+")"),
+                precedence(SessionId2, SessionId1),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+            ;
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+                precedence(SessionId1, SessionId2),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+        ;;
+
+        // We try to resolv disjunct by putting the session with the lowest index first (if the min values are equal)
+        resolv_disjunct_Index1_le_Index2 @
+            session(SessionId1, ClassId1, Index1) #passive,
+            session(SessionId2, ClassId2, Index2) #passive
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive,
+            labeling_disjunct(DisjunctId, LabelingStep)
+        [self,std]<=>
+            (*Index1) <= (*Index2)
+            |
+            self.debug("resolv_disjunct_Index1_le_Index2 disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+                precedence(SessionId1, SessionId2),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+            ;
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId2)+", "+std::to_string(*SessionId1)+")"),
+                precedence(SessionId2, SessionId1),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+        ;;
+
+        // We try to resolv disjunct by putting the session with the lowest index first (if the min values are equal)
+        resolv_disjunct_Index1_gt_Index2 @
+            session(SessionId1, ClassId1, Index1) #passive,
+            session(SessionId2, ClassId2, Index2) #passive
+            \
+            disjunct(DisjunctId, SessionId1, SessionId2) #passive,
+            labeling_disjunct(DisjunctId, LabelingStep)
+        [self,std]<=>
+            (*Index1) > (*Index2)
+            |
+            self.debug("resolv_disjunct_Index1_gt_Index2 disjunct("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId2)+", "+std::to_string(*SessionId1)+")"),
+                precedence(SessionId2, SessionId1),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+            ;
+            (
+                self.debug("=> precedence("+std::to_string(*SessionId1)+", "+std::to_string(*SessionId2)+")"),
+                precedence(SessionId1, SessionId2),
+                labeling_disjunct(DisjunctId+1, LabelingStep)
+            )
+        ;;
+
+        resolv_removed_disjunct @
+            labeling_disjunct(DisjunctId, LabelingStep)
+        <=>
+            labeling_disjunct(DisjunctId+1, LabelingStep)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // - LABELING all rooms
+        // Each time a room is instanced, the rule two_sessions_same_room may be triggered and
+        // then adds some not_same_room_same_time() constraints.
+        // Before going to the next room to instantiate, we may arbitrate the precedences
+        // between two sessions involved in a not_same_room_same_time() constraint
+        generate_rooms_success @
+            nr_sessions(S),
+            next_disjunct_id(NextDisjunctId) #passive
+            \
+            labeling_rooms(-1)
+        [self]<=>
+            labeling_teachers(*S-1) // next labeling : teachers
+        ;;
+
+        generate_group_rooms_success @
+            labeling_group_rooms(SessionId, -1)
+        <=>
+            labeling_not_same_room_same_time(*SessionId-1)
+        ;;
+
+        generate_group_rooms @
+            session(SessionId, ClassId, SessionIndex),
+            class_size(ClassId, NbGroups)
+            \
+            labeling_rooms(SessionId)
+        <=>
+            labeling_group_rooms(SessionId, *NbGroups-1)
+        ;;
+
+        generate_rooms @
+            session_group_room(SessionId, GroupId, Room),
+            session(SessionId, ClassId, SessionIndex),
+            class_group(ClassId, GroupId, GroupIndex)
+            \
+            labeling_group_rooms(SessionId, GroupIndex)
+        [self]<=>
+            exists(room,
+                (*Room),
+                (
+                    self.setSessionGroupRoom(*SessionId, *GroupIndex, room, Room),
+                    labeling_group_rooms(SessionId, *GroupIndex-1)
+                )
+            )
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // - ARBITRATING not_same_room_same_time()
+        // If two sessions are involved in a not_same_room_same_time() constraint, the two sessions
+        // cannot occur at the same time. We set a precedence() constraint to ensure the statement
+        //
+        // If a not_same_room_same_time() is in the store, we arbitrate the precedence
+        // and go for the next not_same_room_same_time() constraint
+        arbitrate_two_sessions_not_same_room_same_time @
+            not_same_room_same_time(Session1, Session2),
+            labeling_not_same_room_same_time(NextSession)
+        [self]<=>
+            (
+                precedence(Session1, Session2),
+                labeling_not_same_room_same_time(NextSession)
+            )
+           ;
+           (
+                precedence(Session2, Session1),
+                labeling_not_same_room_same_time(NextSession)
+            )
+        ;;
+
+        // No more not_same_room_same_time() constraint, we go for next room to instantiate
+        end_arbitrate_two_not_same_room_same_time @
+            labeling_not_same_room_same_time(NextSession)
+        <=>
+            labeling_rooms(NextSession)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // - LABELING all teachers
+        // Each time a teacher is instanced, the rule two_sessions_same_teacher may be triggered and
+        // then adds some not_same_teacher_same_time() constraints.
+        // Before going to the next teacher to instantiate, we may arbitrate the precedences
+        // between two sessions involved in a not_same_teacher_same_time() constraint
+        generate_teachers_success @
+            nr_sessions(S),
+            next_disjunct_id(NextDisjunctId) #passive
+            \
+            labeling_teachers(-1)
+        [self]<=>
+            labeling_slots(*S-1)
+        ;;
+
+        generate_n_teacher_success @
+            labeling_n_teacher(SessionId, -1)
+        <=>
+            labeling_not_same_teacher_same_time(*SessionId-1)
+        ;;
+
+        generate_n_teacher @
+            session_nr_teachers(SessionId, NrTeachers)
+            \
+            labeling_teachers(SessionId)
+        <=>
+            labeling_n_teacher(SessionId, *NrTeachers-1)
+        ;;
+
+        generate_teachers @
+            session_teacher(SessionId, TeacherIndex, Teacher)
+            \
+            labeling_n_teacher(SessionId, TeacherIndex)
+        [self]<=>
+            exists(teacher,
+                (*Teacher),
+                (
+                    self.setTeacher(teacher, Teacher),
+                    labeling_n_teacher(*SessionId, *TeacherIndex-1)
+                )
+            )
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // - ARBITRATING not_same_teacher_same_time()
+        // If two sessions are involved in a not_same_teacher_same_time() constraint, the two sessions
+        // cannot occur at the same time. We set a precedence() constraint to ensure the statement
+        //
+        // If a not_same_teacher_same_time() is in the store, we arbitrate the precedence
+        // and go for the next not_same_teacher_same_time() constraint
+        arbitrate_two_sessions_not_same_teacher_same_time @
+            not_same_teacher_same_time(Session1, Session2),
+            labeling_not_same_teacher_same_time(NextSession)
+        [self]<=>
+            (
+                precedence(Session1, Session2),
+                labeling_not_same_teacher_same_time(NextSession)
+            )
+           ;
+           (
+                precedence(Session2, Session1),
+                labeling_not_same_teacher_same_time(NextSession)
+            )
+        ;;
+
+        // No more not_same_teacher_same_time() constraint, we go for next teacher to instantiate
+        end_arbitrate_two_not_same_teacher_same_time @
+            labeling_not_same_teacher_same_time(NextSession)
+        <=>
+            labeling_teachers(NextSession)
+        ;;
+
+        // -------------------------------------------------------------------------------
+        // - LABELING all slots
+		// We labeling all the slots. Notice that if the precedences are satisfied and the
+		// rooms are set, the labeling should be "easy" to satisfy.
+        generate_slots_success @
+            labeling_slots(-1)
+        [self]<=>
+            self.end()
+        ;;
+
+        generate_slots @
+            session_slot(Session, StartSlot, EndSlot, SessionLength) #passive
+            \
+            labeling_slots(Session)
+        [self]<=>
+            exists(slot,
+                (*StartSlot),
+                (
+                    self.setSessionSlot(*Session, slot, StartSlot),
+                    labeling_slots(*Session-1)
+                )
+            )
+        ;;
+
+    </CHR>*/
+
+public:
+    /**
+     * Defines the capacity of each room.
+     * @param roomCapacities Maximum capacity of rooms
+     */
+    void initRoomCapacities(std::vector<int> roomCapacities) {
+        m_roomCapacities=roomCapacities;
+    }
+    
+    void initDaysPerWeek(int daysPerWeek) {
+        m_daysPerWeek = daysPerWeek;
+    }
+
+    void initSlotsPerWeek(int spw) {
+        m_slotsPerWeek = spw;
+    }
+
+    chr::ES_CHR initNrSlots(int nrSlots) {
+        m_slots = nrSlots;
+
+        // Init internal vars
+        CHECK_ES( first_disjunct_id(0) );
+        CHECK_ES( next_disjunct_id(0) );
+        CHECK_ES( state(0) );
+
+        return chr::success();
+    }
+
+    void initSlotsPerDay(int slotsPerDay) {
+        m_slotsPerDay = slotsPerDay;
+    }
+
+    chr::ES_CHR initSessionIds(const std::vector< std::string >& sessionIds) {
+        m_sessionIds = sessionIds;
+        m_sessions = static_cast<int>(sessionIds.size());
+
+        return nr_sessions(m_sessions);
+    }
+
+    chr::ES_CHR initSession(int sessionId, int classId, int index) {
+        return session(sessionId, classId, index);
+    }
+
+    chr::ES_CHR initClass(int classId, std::vector<int> const &groupIds) {
+        CHECK_ES( class_size(classId, groupIds.size()) );
+
+        for(size_t i=0; i<groupIds.size(); ++i) {
+            CHECK_ES( class_group(classId, groupIds[i], i) );
+        }
+
+        return chr::success();
+    }
+
+    chr::ES_CHR initSessionGroupRoom(int session, int group, chr::Logical_var_mutable< intvar > &domain) {
+        // just to initialize the map's vector:
+        m_sessionGroupRoom[session].push_back(-1);
+
+        // we add the session to the group's session
+        m_groupSessions[group].push_back(session);
+
+        return session_group_room(session, group, domain);
+    }
+
+    chr::ES_CHR initSessionSlot(int session, chr::Logical_var_mutable< intvar > &domainStart, int length) {
+        assert(length > 0);
+        assert(length <= m_slotsPerDay);
+
+        // we shift the end from the start according to the length
+        // /!\ the end is at start+length-1
+        chr::Logical_var_mutable< intvar > domainEnd(intvar(*domainStart, length-1));
+
+        m_sessionLength[session] = length;
+
+        return post_session_slot(session, domainStart, domainEnd, length);
+    }
+
+    chr::ES_CHR initSessionTeacher(int session, int teacherIndex, chr::Logical_var_mutable< intvar > &domain) {
+        return session_teacher(session, teacherIndex, domain);
+    }
+
+    chr::ES_CHR initSessionNrTeachers(int session, int nrTeachers) {
+        return session_nr_teachers(session, nrTeachers);
+    }
+
+    /**
+     * Defines a group of sessions with same attendees.
+     * @param session_ids : set of session ids which have the same attendees
+     */
+    chr::ES_CHR sameAttendees(const std::vector<int>& session_ids) {
+        int size = static_cast<int>(session_ids.size());
+        for(int i=0; i<size-1; ++i) {
+            for(int j=i+1; j<size; ++j) {
+                CHECK_ES( post_disjunct(session_ids[i], session_ids[j]) );
+            }
+        }
+
+        return chr::success();
+    }
+
+    /**
+     * Defines a group of sessions with same room.
+     * @param session_ids : set of session ids that should takes place in the same room
+     */
+    chr::ES_CHR sameRoom(std::vector<int> session_ids) {
+        for(auto sid : session_ids) {
+            CHECK_ES( same_room(m_nextSameRoomId, sid) );
+        }
+
+        m_nextSameRoomId++;
+
+        return chr::success();
+    }
+
+    /**
+     * Defines a group of sessions with same teachers.
+     * @param session_ids : set of session ids that should have the same teachers
+     */
+    chr::ES_CHR sameTeachers(std::vector<int> session_ids) {
+        for(auto sid : session_ids) {
+            CHECK_ES( same_teachers(m_nextSameTeacherId, sid) );
+        }
+
+        m_nextSameTeacherId++;
+
+        return chr::success();
+    }
+
+    /**
+     * Defines a group of sessions with same starting slot.
+     * @param session_ids : set of session ids that should start at the same time
+     */
+    chr::ES_CHR sameStart(std::vector<int> session_ids) {
+        for(auto sid : session_ids) {
+            CHECK_ES( same_start(m_nextSameStartId, sid) );
+        }
+
+        m_nextSameStartId++;
+
+        return chr::success();
+    }
+
+    /**
+     * Defines a group of sessions which should happens the same slot of the week.
+     * @param session_ids : set of session ids that should be the same day of the week
+     */
+    chr::ES_CHR sameDays(std::vector<int> session_ids) {
+        chr::Logical_var_mutable< intvar > modulo(intvar(0, m_slotsPerWeek-1));
+        for(auto sid : session_ids) {
+            CHECK_ES( same_days(modulo, sid) );
+        }
+
+        m_nextSameDaysId++;
+
+        return chr::success();
+    }
+
+    /**
+     * Defines a group of sessions which should happen the same slot of the week, consecutivly.
+     * The sessions should be ordered!
+     * @param session_ids : ordered set of session ids that should be the same slot of the week
+     */
+    chr::ES_CHR weekly(std::vector<int> session_ids) {
+        size_t i=1;
+        int sid = session_ids[0];
+        m_weeklySessions.emplace(m_nextWeeklyId, std::vector<int>());
+        while(i<session_ids.size()) {
+            CHECK_ES( session_shift(sid, session_ids[i], m_slotsPerWeek) );
+            CHECK_ES( weekly_session(m_nextWeeklyId, sid) );
+            m_weeklySessions[m_nextWeeklyId].push_back(sid);
+            sid = session_ids[i];
+            ++i;
+        }
+
+        m_weeklySessions[m_nextWeeklyId].push_back(sid);
+        CHECK_ES( weekly_session(m_nextWeeklyId, sid) );
+        CHECK_ES( weekly(m_nextWeeklyId++, session_ids[0]) )
+
+        return chr::success();
+    }
+
+    /**
+     * Defines a group of sessions that should happen the same week
+     * @param session_ids : set of session ids that should be the same week
+     */
+    chr::ES_CHR sameWeek(std::vector<int> session_ids) {
+        chr::Logical_var_mutable< intvar > div(intvar(0, (m_slots/m_slotsPerWeek)-1));
+        for(auto sid : session_ids) {
+            CHECK_ES( same_week(div, sid) );
+        }
+
+        m_nextSameDaysId++;
+
+        return chr::success();
+    }
+
+    chr::ES_CHR atMost(std::vector<int> session_ids, int threshold, int rangeMin, int rangeMax) {
+        assert(threshold >= 0);
+
+        for(auto sid : session_ids) {
+            CHECK_ES( atmost_session_slots(m_nextAtMostId, sid) );
+        }
+
+        CHECK_ES( atmost_slots(m_nextAtMostId, threshold, rangeMin, rangeMax) );
+        m_nextAtMostId++;
+
+        return chr::success();
+    }
+
+    chr::ES_CHR atMostTeacher(std::vector<int> session_ids, int threshold, int rangeMin, int rangeMax, int teacherId) {
+        assert(threshold >= 0);
+
+        for(auto sid : session_ids) {
+            CHECK_ES( atmost_teacher_session_slots(m_nextAtMostTeacherId, sid) );
+        }
+
+        CHECK_ES( atmost_teacher_slots(m_nextAtMostTeacherId, threshold, rangeMin, rangeMax, teacherId) );
+        m_nextAtMostTeacherId++;
+
+        return chr::success();
+    }
+
+    chr::ES_CHR forbiddenSlots(std::vector<int> session_ids, int first, int last) {
+        for(auto sid : session_ids) {
+            CHECK_ES( forbidden_slot(sid, first, last) );
+        }
+
+        return chr::success();
+    }
+
+    chr::ES_CHR capacity(int value, int min, int max, std::vector< chr::Logical_var_mutable<intvar> > &variables) {
+        assert(min <= max);
+
+        for(auto &var : variables) {
+            CHECK_ES( capacity_var(m_nextCapacityId, var) );
+        }
+
+        return capacity(m_nextCapacityId++, value, min, max, 0, 0, variables.size());
+    }
+
+    chr::ES_CHR solutionSessionSlot(int classId, int sessionIndex, int dailySlot, int day, int week) {
+        return set_session_slot(classId, sessionIndex, dailySlot + day * m_slotsPerDay + week * m_slotsPerWeek);
+    }
+
+    chr::ES_CHR solutionTeacher(int classId, int sessionIndex, int teacherIndex, int teacherId) {
+        return set_session_teacher(classId, sessionIndex, teacherIndex, teacherId);
+    }
+
+	/**
+	 * Print the constraints of the store.
+	 */
+    chr::ES_CHR print()
+	{
+        std::cout << "===[ STORE ]===" << std::endl;
+        auto it = chr_store_begin();
+		while (!it.at_end())
+        {
+			std::cout << it.string() << std::endl;
+			++it;
+        }
+
+        return chr::success();
+    }
+
+    std::string slot2hours(int dailySlot, bool end=false) {
+        dailySlot++; // dailySlot=0 => 0h01
+        if(end) {
+            dailySlot++; // a dailySlot lasts 1 minute, so the end of the slot is one min later
+        }
+        int h=0,m=0;
+        h = dailySlot / 60;
+        m = dailySlot % 60;
+
+        std::string sh = std::to_string(h);
+        std::string sm = std::to_string(m);
+
+        if(h < 10) {
+            sh = "0"+sh;
+        }
+        if(m < 10) {
+            sm = "0"+sm;
+        }
+
+        return sh+"h"+sm;
+    }
+
+    void print_outputs() {
+        std::cout << "===[ OUTPUT VARIABLES ]===" << std::endl;
+
+        if(chr::failed()) {
+            std::cout << "FAILED" << std::endl;
+            // TODO display error tracking?
+            return;
+        }
+
+        if(!m_ended) {
+            std::cout << "==> NOT ENDED <==" << std::endl;
+        }
+
+        std::string days[] = {"Mon", "Tue", "Wed", "Thu", "Fri"};
+
+        for(int session=0; session<m_sessions; ++session) {
+            int global_slot = m_sessionSlot[session];
+            int week = global_slot / m_slotsPerWeek;
+            int day = (global_slot % m_slotsPerWeek) / m_slotsPerDay;
+            int slot = global_slot % m_slotsPerDay;
+
+            std::ostringstream slot_end;
+            if(m_sessionLength[session] > 1) {
+//                slot_end += " -> " + m_slotNames[ slot+m_sessionLength[session]-1 ]; // should be the same day, so no problem here
+                slot_end << " -> " << slot2hours(slot+m_sessionLength[session]-1, true);
+            }
+
+            std::cout << "Session=" << m_sessionIds[session];
+
+            std::cout << ", Rooms={";
+            std::cout << join(m_sessionGroupRoom[session], ", ");
+            std::cout << "}";
+
+//            std::cout << ", Slot=W" << week << " " << m_dayNames[day] << " @ " << m_slotNames[slot] << slot_end;
+            std::cout << ", Slot=W" << week << " " << days[day] << " @ " << slot2hours(slot) << slot_end.str();
+
+            std::cout << ", Teachers={";
+            std::cout << join(m_sessionTeachers[session], ", ");
+            std::cout << "}";
+
+            std::cout << std::endl;
+        }
+
+        std::cout << "Failures :" << std::endl;
+        for(size_t s=0; s<failures.size(); ++s) {
+            std::cout << s << " : " << failures[s] << std::endl;
+        }
+    }
+
+private:
+    bool m_ended=false;
+
+    int m_nextSameRoomId=0;
+    int m_nextSameTeacherId=0;
+    int m_nextSameStartId=0;
+    int m_nextSameDaysId=0;
+    int m_nextAtMostId=0;
+    int m_nextAtMostTeacherId=0;
+    int m_nextCapacityId=0;
+    int m_nextWeeklyId=0;
+
+    std::vector<int> m_roomCapacities;
+    std::map<int,int> m_sessionSlot;
+    std::map<int,int> m_sessionLength;
+    std::map<int, std::vector<int> > m_sessionGroupRoom;
+
+    std::map<int, std::vector<int> > m_sessionTeachers;
+
+    std::map<int, std::vector<int> > m_groupSessions;
+
+    std::map<int, std::vector<int> > m_weeklySessions;
+
+    int m_slots;
+    int m_slotsPerWeek;
+    int m_slotsPerDay;
+    int m_daysPerWeek;
+
+    int m_sessions;
+
+    std::vector< std::string > m_sessionIds;
+    /*
+    std::vector< std::string > m_dayNames;
+    std::vector< std::string > m_slotNames;
+    */
+
+    std::string join(std::vector<int> const &v, std::string const &glue) {
+        std::string str;
+        auto it = v.begin();
+
+        while(it != v.end()) {
+            str += std::to_string(*it);
+            ++it;
+
+            if(it != v.end()) {
+                str += glue;
+            }
+        }
+
+        return str;
+    }
+};
